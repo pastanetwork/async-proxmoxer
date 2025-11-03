@@ -6,7 +6,21 @@ import sys
 
 from setuptools import setup
 
-from proxmoxer import __version__ as proxmoxer_version
+
+def get_version():
+    """Extract version from __init__.py without importing the module."""
+    init_path = os.path.join(
+        os.path.dirname(__file__), "proxmoxer", "__init__.py"
+    )
+    with codecs.open(init_path, encoding="utf-8") as f:
+        content = f.read()
+    match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+    if match:
+        return match.group(1)
+    raise RuntimeError("Unable to find version string.")
+
+
+proxmoxer_version = get_version()
 
 if not os.path.exists("README.txt") and "sdist" in sys.argv:
     with codecs.open("README.rst", encoding="utf8") as f:
