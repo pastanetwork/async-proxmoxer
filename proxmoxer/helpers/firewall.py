@@ -99,6 +99,7 @@ class FirewallAlias:
     name: str
     cidr: str
     comment: str | None = None
+    digest: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FirewallAlias:
@@ -107,6 +108,7 @@ class FirewallAlias:
             name=data["name"],
             cidr=data["cidr"],
             comment=data.get("comment"),
+            digest=data.get("digest"),
         )
 
 
@@ -117,6 +119,7 @@ class FirewallIPSetEntry:
     cidr: str
     nomatch: bool = False
     comment: str | None = None
+    digest: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FirewallIPSetEntry:
@@ -125,6 +128,7 @@ class FirewallIPSetEntry:
             cidr=data["cidr"],
             nomatch=bool(data.get("nomatch", 0)),
             comment=data.get("comment"),
+            digest=data.get("digest"),
         )
 
 
@@ -134,6 +138,7 @@ class FirewallIPSet:
 
     name: str
     comment: str | None = None
+    digest: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FirewallIPSet:
@@ -141,6 +146,7 @@ class FirewallIPSet:
         return cls(
             name=data["name"],
             comment=data.get("comment"),
+            digest=data.get("digest"),
         )
 
 
@@ -198,9 +204,12 @@ class FirewallRule:
         comment: str | None = None,
         dest: str | None = None,
         dport: str | int | None = None,
+        icmp_type: str | None = None,
         iface: str | None = None,
+        ipversion: int | None = None,
         log: FirewallLogLevel | str | None = None,
         macro: str | None = None,
+        pos: int | None = None,
         proto: FirewallProtocol | str | None = None,
         source: str | None = None,
         sport: str | int | None = None,
@@ -215,9 +224,12 @@ class FirewallRule:
             comment: Rule comment/description
             dest: Destination IP/CIDR
             dport: Destination port or port range
+            icmp_type: ICMP type specification
             iface: Network interface name
+            ipversion: IP version (4 or 6)
             log: Log level
             macro: Use predefined macro
+            pos: Rule position (read-only, set by API)
             proto: Protocol (tcp, udp, icmp, etc.)
             source: Source IP/CIDR
             sport: Source port or port range
@@ -228,9 +240,12 @@ class FirewallRule:
         self.comment = comment
         self.dest = dest
         self.dport = str(dport) if dport is not None else None
+        self.icmp_type = icmp_type
         self.iface = iface
+        self.ipversion = ipversion
         self.log = log
         self.macro = macro
+        self.pos = pos
         self.proto = proto
         self.source = source
         self.sport = str(sport) if sport is not None else None
@@ -255,8 +270,12 @@ class FirewallRule:
             data["dest"] = self.dest
         if self.dport:
             data["dport"] = self.dport
+        if self.icmp_type:
+            data["icmp-type"] = self.icmp_type
         if self.iface:
             data["iface"] = self.iface
+        if self.ipversion:
+            data["ipversion"] = self.ipversion
         if self.log:
             data["log"] = str(self.log)
         if self.macro:
@@ -288,9 +307,12 @@ class FirewallRule:
             comment=data.get("comment"),
             dest=data.get("dest"),
             dport=data.get("dport"),
+            icmp_type=data.get("icmp-type"),
             iface=data.get("iface"),
+            ipversion=data.get("ipversion"),
             log=data.get("log"),
             macro=data.get("macro"),
+            pos=data.get("pos"),
             proto=data.get("proto"),
             source=data.get("source"),
             sport=data.get("sport"),
@@ -859,7 +881,7 @@ class FirewallManager:
         )
         await self.add_rule(rule)
 
-    async def get_log(self) -> ResponseData:
+    async def get_log_raw(self) -> ResponseData:
         """
         Get firewall log.
 
@@ -868,7 +890,7 @@ class FirewallManager:
         """
         return await self._fw_resource.log.get()
 
-    async def get_refs(self) -> ResponseData:
+    async def get_refs_raw(self) -> ResponseData:
         """
         Get firewall references.
 

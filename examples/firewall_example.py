@@ -1,16 +1,12 @@
 """
-Comprehensive Firewall Management Example
+FirewallManager Example - Firewall Rules and Configuration
 
-Demonstrates all firewall management capabilities with the async Proxmoxer library.
+This example demonstrates firewall management including rules, IP sets,
+aliases, and logging.
 """
-
 import asyncio
-import sys
-
-sys.path.insert(0, "..")
-
-from proxmoxer import (
-    ProxmoxAPI,
+from proxmoxer import ProxmoxAPI
+from proxmoxer.helpers import (
     FirewallManager,
     FirewallRule,
     FirewallRuleAction,
@@ -20,424 +16,346 @@ from proxmoxer import (
 )
 
 
-# Configuration
-PROXMOX_HOST = "10.0.0.1"
-PROXMOX_USER = "root@pam"
-PROXMOX_PASSWORD = "your_password"
-NODE = "pve"
-VMID = 100
-
-
-async def example_basic_firewall():
-    """Example 1: Basic firewall configuration."""
-    print("\n=== Example 1: Basic Firewall Setup ===\n")
-
-    async with await ProxmoxAPI.create(
-        host=PROXMOX_HOST,
-        user=PROXMOX_USER,
-        password=PROXMOX_PASSWORD,
-        verify_ssl=False,
-    ) as proxmox:
-        # Create firewall manager
-        fw = FirewallManager(proxmox, NODE, VMID)
-
-        # Enable firewall
-        print("Enabling firewall...")
-        await fw.enable()
-
-        # Set basic options
-        print("Configuring firewall options...")
-        await fw.set_options(
-            dhcp=True,  # Allow DHCP
-            ipfilter=True,  # Enable IP filtering
-            policy_in="DROP",  # Drop all incoming by default
-            policy_out="ACCEPT",  # Allow all outgoing
-            log_level_in=FirewallLogLevel.INFO,
-        )
-
-        print("✓ Basic firewall configured")
-
-
-async def example_rules_management():
-    """Example 2: Managing firewall rules."""
-    print("\n=== Example 2: Firewall Rules Management ===\n")
-
-    async with await ProxmoxAPI.create(
-        host=PROXMOX_HOST,
-        user=PROXMOX_USER,
-        password=PROXMOX_PASSWORD,
-        verify_ssl=False,
-    ) as proxmox:
-        fw = FirewallManager(proxmox, NODE, VMID)
-
-        # Add rule to allow SSH from specific IP
-        print("Adding SSH rule...")
-        await fw.allow_ssh(source="192.168.1.0/24")
-
-        # Add rule to allow HTTP from anywhere
-        print("Adding HTTP rule...")
-        await fw.allow_http()
-
-        # Add rule to allow HTTPS from anywhere
-        print("Adding HTTPS rule...")
-        await fw.allow_https()
-
-        # Add custom rule for MySQL
-        print("Adding MySQL rule...")
-        mysql_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.TCP,
-            dport=3306,
-            source="10.0.1.0/24",
-            comment="Allow MySQL from internal network",
-        )
-        await fw.add_rule(mysql_rule)
-
-        # Add rule to block specific IP
-        print("Blocking malicious IP...")
-        await fw.block_ip("1.2.3.4", comment="Blocked - suspicious activity")
-
-        # List all rules
-        print("\nCurrent firewall rules:")
-        rules = await fw.get_rules()
-        for i, rule in enumerate(rules):
-            enabled = "✓" if rule.enable else "✗"
-            print(f"  [{i}] {enabled} {rule}")
-
-        print(f"\n✓ {len(rules)} rules configured")
-
-
-async def example_advanced_rules():
-    """Example 3: Advanced firewall rules."""
-    print("\n=== Example 3: Advanced Rules ===\n")
-
-    async with await ProxmoxAPI.create(
-        host=PROXMOX_HOST,
-        user=PROXMOX_USER,
-        password=PROXMOX_PASSWORD,
-        verify_ssl=False,
-    ) as proxmox:
-        fw = FirewallManager(proxmox, NODE, VMID)
-
-        # Allow port range
-        print("Allowing port range 8000-8100...")
-        port_range_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.TCP,
-            dport="8000:8100",  # Port range
-            comment="Allow application ports",
-        )
-        await fw.add_rule(port_range_rule)
-
-        # Allow UDP for VPN
-        print("Allowing OpenVPN...")
-        openvpn_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.UDP,
-            dport=1194,
-            comment="Allow OpenVPN",
-        )
-        await fw.add_rule(openvpn_rule)
-
-        # Allow ICMP (ping)
-        print("Allowing ICMP ping...")
-        icmp_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.ICMP,
-            comment="Allow ping",
-        )
-        await fw.add_rule(icmp_rule)
-
-        # Reject with log
-        print("Adding reject rule with logging...")
-        reject_rule = FirewallRule(
-            action=FirewallRuleAction.REJECT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.TCP,
-            dport=23,  # Telnet
-            log=FirewallLogLevel.WARNING,
-            comment="Reject Telnet (insecure)",
-        )
-        await fw.add_rule(reject_rule)
-
-        print("✓ Advanced rules configured")
-
-
-async def example_aliases():
-    """Example 4: Using firewall aliases."""
-    print("\n=== Example 4: Firewall Aliases ===\n")
-
-    async with await ProxmoxAPI.create(
-        host=PROXMOX_HOST,
-        user=PROXMOX_USER,
-        password=PROXMOX_PASSWORD,
-        verify_ssl=False,
-    ) as proxmox:
-        fw = FirewallManager(proxmox, NODE, VMID)
-
-        # Create aliases for common IPs
-        print("Creating IP aliases...")
-
-        await fw.add_alias(
-            "admin_workstation", "192.168.1.100", comment="Admin workstation"
-        )
-
-        await fw.add_alias("office_network", "192.168.1.0/24", comment="Office network")
-
-        await fw.add_alias("vpn_gateway", "10.0.10.1", comment="VPN gateway")
-
-        # Use aliases in rules
-        print("Creating rules with aliases...")
-
-        # Allow SSH from admin workstation
-        admin_ssh_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.TCP,
-            dport=22,
-            source="admin_workstation",  # Use alias
-            comment="Allow SSH from admin",
-        )
-        await fw.add_rule(admin_ssh_rule)
-
-        # List all aliases
-        print("\nConfigured aliases:")
-        aliases = await fw.get_aliases()
-        for alias in aliases:
-            comment = alias.comment or 'N/A'
-            print(f"  - {alias.name}: {alias.cidr} ({comment})")
-
-        print(f"\n✓ {len(aliases)} aliases configured")
-
-
-async def example_ipsets():
-    """Example 5: Using IP sets."""
-    print("\n=== Example 5: IP Sets ===\n")
-
-    async with await ProxmoxAPI.create(
-        host=PROXMOX_HOST,
-        user=PROXMOX_USER,
-        password=PROXMOX_PASSWORD,
-        verify_ssl=False,
-    ) as proxmox:
-        fw = FirewallManager(proxmox, NODE, VMID)
-
-        # Create IP set for allowed IPs
-        print("Creating 'allowed_ips' IP set...")
-        await fw.create_ipset("allowed_ips", comment="Trusted IPs")
-
-        # Add IPs to the set
-        print("Adding IPs to set...")
-        await fw.add_ipset_entry("allowed_ips", "192.168.1.100", comment="Admin PC")
-        await fw.add_ipset_entry("allowed_ips", "192.168.1.101", comment="Developer PC")
-        await fw.add_ipset_entry("allowed_ips", "10.0.10.0/24", comment="VPN network")
-
-        # Create IP set for blocked IPs
-        print("Creating 'blocked_ips' IP set...")
-        await fw.create_ipset("blocked_ips", comment="Blocked IPs")
-
-        await fw.add_ipset_entry("blocked_ips", "1.2.3.4", comment="Attacker")
-        await fw.add_ipset_entry("blocked_ips", "5.6.7.8", comment="Scanner")
-
-        # Use IP sets in rules
-        print("Creating rules with IP sets...")
-
-        # Allow access from allowed_ips
-        allowed_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            source="+allowed_ips",  # Reference IP set with +
-            comment="Allow from trusted IPs",
-        )
-        await fw.add_rule(allowed_rule)
-
-        # Block access from blocked_ips
-        blocked_rule = FirewallRule(
-            action=FirewallRuleAction.DROP,
-            type=FirewallRuleType.IN,
-            source="+blocked_ips",  # Reference IP set with +
-            comment="Block malicious IPs",
-        )
-        await fw.add_rule(blocked_rule)
-
-        # List all IP sets
-        print("\nConfigured IP sets:")
-        ipsets = await fw.get_ipsets()
-        for ipset in ipsets:
-            comment = ipset.comment or 'N/A'
-            print(f"\n  {ipset.name} ({comment})")
-
-            entries = await fw.get_ipset_entries(ipset.name)
-            for entry in entries:
-                entry_comment = entry.comment or 'N/A'
-                print(f"    - {entry.cidr}: {entry_comment}")
-
-        print(f"\n✓ {len(ipsets)} IP sets configured")
-
-
-async def example_complete_setup():
-    """Example 6: Complete firewall setup for web server."""
-    print("\n=== Example 6: Complete Web Server Firewall ===\n")
-
-    async with await ProxmoxAPI.create(
-        host=PROXMOX_HOST,
-        user=PROXMOX_USER,
-        password=PROXMOX_PASSWORD,
-        verify_ssl=False,
-    ) as proxmox:
-        fw = FirewallManager(proxmox, NODE, VMID)
-
-        print("Setting up web server firewall...\n")
-
-        # 1. Enable firewall with strict policy
-        print("1. Enabling firewall with DROP policy...")
-        await fw.set_options(
-            enable=True,
-            policy_in="DROP",  # Drop all by default
-            policy_out="ACCEPT",  # Allow outgoing
-            dhcp=True,
-            ipfilter=True,
-            log_level_in=FirewallLogLevel.INFO,
-            log_level_out=FirewallLogLevel.NOTICE,
-        )
-
-        # 2. Create IP sets
-        print("2. Creating IP sets...")
-        await fw.create_ipset("admin_ips", comment="Admin IPs")
-        await fw.add_ipset_entry("admin_ips", "192.168.1.100")
-        await fw.add_ipset_entry("admin_ips", "10.0.10.0/24")
-
-        # 3. Allow SSH from admins only
-        print("3. Allowing SSH (admin only)...")
-        ssh_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.TCP,
-            dport=22,
-            source="+admin_ips",
-            log=FirewallLogLevel.INFO,
-            comment="SSH - admin only",
-        )
-        await fw.add_rule(ssh_rule)
-
-        # 4. Allow HTTP/HTTPS from anywhere
-        print("4. Allowing HTTP/HTTPS (public)...")
-        await fw.allow_http()
-        await fw.allow_https()
-
-        # 5. Allow database from app servers
-        print("5. Allowing MySQL (from app servers)...")
-        db_rule = FirewallRule(
-            action=FirewallRuleAction.ACCEPT,
-            type=FirewallRuleType.IN,
-            proto=FirewallProtocol.TCP,
-            dport=3306,
-            source="10.0.20.0/24",
-            comment="MySQL from app servers",
-        )
-        await fw.add_rule(db_rule)
-
-        # 6. Allow ICMP
-        print("6. Allowing ICMP (ping)...")
-        await fw.add_rule(
-            FirewallRule(
-                action=FirewallRuleAction.ACCEPT,
-                type=FirewallRuleType.IN,
-                proto=FirewallProtocol.ICMP,
-                comment="Allow ping",
-            )
-        )
-
-        # 7. Log and reject everything else
-        print("7. Setting up logging for rejected traffic...")
-        # (This is done by the DROP policy with log_level_in)
-
-        print("\n✓ Web server firewall fully configured!")
-
-        # Show final configuration
-        print("\nFinal configuration:")
-        options = await fw.get_options()
-        print(f"  Firewall: {'Enabled' if options.enable else 'Disabled'}")
-        print(f"  Policy IN: {options.policy_in}")
-        print(f"  Policy OUT: {options.policy_out}")
-
-        rules = await fw.get_rules()
-        print(f"  Rules: {len(rules)}")
-
-        ipsets = await fw.get_ipsets()
-        print(f"  IP Sets: {len(ipsets)}")
-
-
-async def example_rule_management():
-    """Example 7: Managing existing rules."""
-    print("\n=== Example 7: Rule Management ===\n")
-
-    async with await ProxmoxAPI.create(
-        host=PROXMOX_HOST,
-        user=PROXMOX_USER,
-        password=PROXMOX_PASSWORD,
-        verify_ssl=False,
-    ) as proxmox:
-        fw = FirewallManager(proxmox, NODE, VMID)
-
-        # List all rules
-        print("Current rules:")
-        rules = await fw.get_rules()
-        for i, rule in enumerate(rules):
-            print(f"  [{i}] {rule}")
-
-        if rules:
-            # Update first rule
-            print(f"\nUpdating rule 0...")
-            updated_rule = rules[0]
-            updated_rule.comment = "Updated comment"
-            await fw.update_rule(0, updated_rule)
-
-            # Move rule
-            if len(rules) > 1:
-                print(f"Moving rule 0 to position 1...")
-                await fw.move_rule(0, 1)
-
-            # Delete last rule
-            print(f"Deleting last rule...")
-            await fw.delete_rule(len(rules) - 1)
-
-        print("\n✓ Rules managed successfully")
-
-
 async def main():
-    """Run all examples."""
+    # Initialize connection
+    proxmox = await ProxmoxAPI.create(
+        host="pve.example.com",
+        user="root@pam",
+        password="password",
+        verify_ssl=False,
+    )
+
+    # Firewall manager for specific VM
+    fw = FirewallManager(proxmox, node="pve-node1", vmid=100)
+
     print("=" * 60)
-    print("Proxmoxer Firewall Management Examples")
+    print("FirewallManager Examples - Firewall Configuration")
     print("=" * 60)
 
-    examples = [
-        ("Basic Firewall Setup", example_basic_firewall),
-        ("Rules Management", example_rules_management),
-        ("Advanced Rules", example_advanced_rules),
-        ("Firewall Aliases", example_aliases),
-        ("IP Sets", example_ipsets),
-        ("Complete Web Server Setup", example_complete_setup),
-        ("Rule Management", example_rule_management),
-    ]
+    # ========================================
+    # 1. ENABLE FIREWALL
+    # ========================================
+    print("\n[1] ENABLE FIREWALL")
+    print("-" * 60)
 
-    for name, example_func in examples:
-        try:
-            await example_func()
-        except Exception as e:
-            print(f"\nExample '{name}' failed: {e}")
-            import traceback
+    await fw.enable()
+    print("Firewall enabled for VM 100")
 
-            traceback.print_exc()
+    # Get current options
+    options = await fw.get_options()
+    print(f"Firewall enabled: {options.enable}")
+    print(f"Policy IN: {options.policy_in}")
+    print(f"Policy OUT: {options.policy_out}")
 
-        await asyncio.sleep(1)
+    # ========================================
+    # 2. SET FIREWALL OPTIONS
+    # ========================================
+    print("\n[2] SET FIREWALL OPTIONS")
+    print("-" * 60)
 
+    await fw.set_options(
+        enable=True,
+        dhcp=True,
+        ipfilter=True,
+        policy_in="DROP",
+        policy_out="ACCEPT",
+        log_level_in=FirewallLogLevel.INFO,
+        log_level_out=FirewallLogLevel.NOTICE,
+    )
+    print("Firewall options configured")
+
+    # ========================================
+    # 3. ADD FIREWALL RULES
+    # ========================================
+    print("\n[3] ADD FIREWALL RULES")
+    print("-" * 60)
+
+    # Allow SSH
+    rule_ssh = FirewallRule(
+        action=FirewallRuleAction.ACCEPT,
+        type=FirewallRuleType.IN,
+        proto=FirewallProtocol.TCP,
+        dport=22,
+        comment="Allow SSH",
+    )
+    await fw.add_rule(rule_ssh)
+    print("Added rule: Allow SSH (port 22)")
+
+    # Allow HTTP
+    rule_http = FirewallRule(
+        action=FirewallRuleAction.ACCEPT,
+        type=FirewallRuleType.IN,
+        proto=FirewallProtocol.TCP,
+        dport=80,
+        comment="Allow HTTP",
+    )
+    await fw.add_rule(rule_http)
+    print("Added rule: Allow HTTP (port 80)")
+
+    # Allow HTTPS
+    rule_https = FirewallRule(
+        action=FirewallRuleAction.ACCEPT,
+        type=FirewallRuleType.IN,
+        proto=FirewallProtocol.TCP,
+        dport=443,
+        comment="Allow HTTPS",
+    )
+    await fw.add_rule(rule_https)
+    print("Added rule: Allow HTTPS (port 443)")
+
+    # Allow from specific IP
+    rule_mysql = FirewallRule(
+        action=FirewallRuleAction.ACCEPT,
+        type=FirewallRuleType.IN,
+        proto=FirewallProtocol.TCP,
+        source="192.168.1.100/32",
+        dport=3306,
+        comment="Allow MySQL from admin server",
+    )
+    await fw.add_rule(rule_mysql)
+    print("Added rule: Allow MySQL from 192.168.1.100")
+
+    # Block outgoing SMTP
+    rule_smtp = FirewallRule(
+        action=FirewallRuleAction.REJECT,
+        type=FirewallRuleType.OUT,
+        proto=FirewallProtocol.TCP,
+        dport=25,
+        comment="Block outgoing SMTP",
+    )
+    await fw.add_rule(rule_smtp)
+    print("Added rule: Block outgoing SMTP")
+
+    # ========================================
+    # 4. LIST FIREWALL RULES
+    # ========================================
+    print("\n[4] LIST FIREWALL RULES")
+    print("-" * 60)
+
+    rules = await fw.get_rules()
+    print(f"Total rules: {len(rules)}")
+    for rule in rules:
+        print(f"\n  Rule {rule.pos}:")
+        print(f"    Type: {rule.type}")
+        print(f"    Action: {rule.action}")
+        print(f"    Protocol: {rule.proto}")
+        if rule.dport:
+            print(f"    Port: {rule.dport}")
+        if rule.source:
+            print(f"    Source: {rule.source}")
+        if rule.comment:
+            print(f"    Comment: {rule.comment}")
+        print(f"    Enabled: {rule.enable}")
+
+    # ========================================
+    # 5. UPDATE FIREWALL RULE
+    # ========================================
+    print("\n[5] UPDATE FIREWALL RULE")
+    print("-" * 60)
+
+    # Get the SSH rule and update it to enable logging
+    ssh_rule = await fw.get_rule(0)
+    ssh_rule.log = FirewallLogLevel.INFO
+    ssh_rule.comment = "Allow SSH (with logging)"
+    await fw.update_rule(0, ssh_rule)
+    print("Updated SSH rule to enable logging")
+
+    # ========================================
+    # 6. IP ALIASES
+    # ========================================
+    print("\n[6] IP ALIASES")
+    print("-" * 60)
+
+    # Add IP alias
+    await fw.add_alias(
+        name="admin_server",
+        cidr="192.168.1.100/32",
+        comment="Administrator server",
+    )
+    print("Added IP alias: admin_server")
+
+    await fw.add_alias(
+        name="office_network",
+        cidr="192.168.1.0/24",
+        comment="Office network",
+    )
+    print("Added IP alias: office_network")
+
+    # List aliases
+    aliases = await fw.get_aliases()
+    print(f"\nIP Aliases: {len(aliases)}")
+    for alias in aliases:
+        print(f"  - {alias.name}: {alias.cidr}")
+        if alias.comment:
+            print(f"    {alias.comment}")
+
+    # ========================================
+    # 7. IP SETS
+    # ========================================
+    print("\n[7] IP SETS")
+    print("-" * 60)
+
+    # Create IP set
+    await fw.create_ipset(
+        name="whitelist",
+        comment="Whitelisted IPs",
+    )
+    print("Created IP set: whitelist")
+
+    # Add entries to IP set
+    await fw.add_ipset_entry(
+        ipset_name="whitelist",
+        cidr="10.0.1.0/24",
+        comment="Internal network",
+    )
+    print("Added 10.0.1.0/24 to whitelist")
+
+    await fw.add_ipset_entry(
+        ipset_name="whitelist",
+        cidr="10.0.2.0/24",
+        comment="Partner network",
+    )
+    print("Added 10.0.2.0/24 to whitelist")
+
+    # List IP sets
+    ipsets = await fw.get_ipsets()
+    print(f"\nIP Sets: {len(ipsets)}")
+    for ipset in ipsets:
+        print(f"  - {ipset.name}")
+        if ipset.comment:
+            print(f"    {ipset.comment}")
+
+    # List IP set entries
+    entries = await fw.get_ipset_entries("whitelist")
+    print(f"\nWhitelist entries: {len(entries)}")
+    for entry in entries:
+        print(f"  - {entry.cidr}: {entry.comment}")
+
+    # ========================================
+    # 8. USE IP SET IN RULE
+    # ========================================
+    print("\n[8] USE IP SET IN FIREWALL RULE")
+    print("-" * 60)
+
+    # Add rule using IP set
+    rule_whitelist = FirewallRule(
+        action=FirewallRuleAction.ACCEPT,
+        type=FirewallRuleType.IN,
+        source="+whitelist",  # + prefix for IP set
+        comment="Allow from whitelist",
+    )
+    await fw.add_rule(rule_whitelist)
+    print("Added rule using whitelist IP set")
+
+    # ========================================
+    # 9. CONVENIENCE METHODS
+    # ========================================
+    print("\n[9] CONVENIENCE METHODS")
+    print("-" * 60)
+
+    # Use built-in convenience methods
+    # Note: These are just examples, don't actually run if rules already exist
+    # await fw.allow_ssh()
+    # await fw.allow_http()
+    # await fw.allow_https()
+    print("Convenience methods available: allow_ssh(), allow_http(), allow_https()")
+
+    # ========================================
+    # 10. FIREWALL LOGS
+    # ========================================
+    print("\n[10] FIREWALL LOGS")
+    print("-" * 60)
+
+    # Get firewall logs
+    try:
+        logs = await fw.get_log(limit=10)
+        print(f"Recent firewall logs: {len(logs)}")
+        for log in logs[:5]:
+            print(f"  Line {log.n}: {log.t}")
+    except Exception as e:
+        print(f"Could not retrieve logs: {e}")
+
+    # ========================================
+    # 11. FIREWALL REFS (Rule Analysis)
+    # ========================================
+    print("\n[11] FIREWALL REFS")
+    print("-" * 60)
+
+    try:
+        refs = await fw.get_refs()
+        print(f"Firewall references: {len(refs)}")
+        for ref in refs[:5]:
+            print(f"  - {ref.type}: {ref.name}")
+    except Exception as e:
+        print(f"Could not retrieve refs: {e}")
+
+    # ========================================
+    # 12. DISABLE SPECIFIC RULE
+    # ========================================
+    print("\n[12] DISABLE SPECIFIC RULE")
+    print("-" * 60)
+
+    # Disable the outgoing SMTP block temporarily
+    smtp_rule = await fw.get_rule(4)
+    smtp_rule.enable = False
+    await fw.update_rule(4, smtp_rule)
+    print("Disabled outgoing SMTP block rule")
+
+    # ========================================
+    # 13. MOVE RULE
+    # ========================================
+    print("\n[13] MOVE RULE POSITION")
+    print("-" * 60)
+
+    # Move rule to different position
+    await fw.move_rule(pos=4, new_pos=2)
+    print("Moved rule from position 4 to position 2")
+
+    # ========================================
+    # 14. CLEANUP (OPTIONAL)
+    # ========================================
+    print("\n[14] CLEANUP")
+    print("-" * 60)
+
+    # Delete IP set entry
+    await fw.delete_ipset_entry("whitelist", "10.0.2.0/24")
+    print("Deleted IP set entry")
+
+    # Delete IP alias
+    await fw.delete_alias("admin_server")
+    print("Deleted IP alias")
+
+    # Delete rule
+    await fw.delete_rule(pos=5)
+    print("Deleted rule at position 5")
+
+    # Disable firewall
+    # await fw.disable()
+    # print("Firewall disabled")
+
+    # ========================================
+    # SUMMARY
+    # ========================================
     print("\n" + "=" * 60)
-    print("Examples completed!")
+    print("FIREWALL MANAGEMENT SUMMARY")
+    print("=" * 60)
+    print("Enable/disable firewall")
+    print("Configure firewall options (policies, logging)")
+    print("Add rules (ACCEPT, REJECT, DROP)")
+    print("Update rules (enable/disable, logging)")
+    print("Move rules to different positions")
+    print("Delete rules")
+    print("Create IP aliases for readability")
+    print("Create IP sets for grouped IPs")
+    print("Use IP sets in rules")
+    print("View firewall logs")
+    print("Analyze rule references")
+    print("\nUse Cases:")
+    print("  - Secure VM access (SSH, HTTP/HTTPS)")
+    print("  - IP whitelisting/blacklisting")
+    print("  - Network segmentation")
+    print("  - Traffic logging and monitoring")
+    print("  - DDoS protection")
     print("=" * 60)
 
 
