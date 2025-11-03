@@ -1,38 +1,32 @@
 repos:
-  ###### FORMATTING ######
-  - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 23.11.0
+  ###### FORMATTING & LINTING ######
+  # Ruff - Fast Python linter (replaces flake8, isort, pyupgrade, black)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.9
     hooks:
-      - id: black
-        language_version: python3 # Should be a command that runs python3.6+
+      # Run the linter with auto-fix
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      # Run the formatter
+      - id: ruff-format
 
-  - repo: https://github.com/PyCQA/isort
-    rev: 5.12.0
+  # MyPy - Type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
     hooks:
-      - id: isort
-        name: isort (python)
-      - id: isort
-        name: isort (pyi)
-        types: [pyi]
+      - id: mypy
+        additional_dependencies:
+          - types-aiofiles
+        args: [--ignore-missing-imports]
+        exclude: ^(tests/|examples/)
 
-  ###### LINTING ######
+  ###### SECURITY ######
   - repo: https://github.com/PyCQA/bandit
-    rev: 1.7.5
+    rev: 1.7.6
     hooks:
       - id: bandit
-        args: ["--configfile", ".bandit", "--baseline", "tests/known_issues.json"]
-
-  - repo: https://github.com/PyCQA/flake8
-    rev: 6.1.0
-    hooks:
-      - id: flake8
-      # any flake8 plugins must be included in the hook venv
-      # additional_dependencies: [flake8-docstrings]
-
-  # - repo: https://github.com/PyCQA/pylint
-  #   rev: v2.8.2
-  #   hooks:
-  #     - id: pylint
+        args: [-ll, -i]
+        exclude: ^tests/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0

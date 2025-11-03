@@ -1,0 +1,7 @@
+# Core async dependencies
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+asyncssh>=2.14.0
+
+# Fast JSON parsing
+orjson>=3.9.0

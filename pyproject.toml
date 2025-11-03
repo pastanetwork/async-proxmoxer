@@ -1,3 +1,108 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proxmoxer"
+dynamic = ["version"]
+description = "Async Python Wrapper for Proxmox REST API"
+readme = "README.rst"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Oleg Butovich", email = "obutovich@gmail.com"}
+]
+keywords = ["proxmox", "api", "async", "asyncio", "aiohttp"]
+
+dependencies = [
+    "aiohttp>=3.9.0",
+    "aiofiles>=23.0.0",
+    "asyncssh>=2.14.0",
+    "orjson>=3.9.0",
+]
+
+[project.optional-dependencies]
+sync = [
+    "requests>=2.20.0",
+    "openssh_wrapper>=0.4.0",
+    "paramiko>=2.7.0",
+    "requests_toolbelt>=0.9.0",
+]
+
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "aioresponses>=0.7.6",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+]
+
+# Ruff configuration (replaces black, flake8, isort)
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+
+ignore = [
+    "E501", # line too long (handled by formatter)
+]
+
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+]
+
+[tool.ruff.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.ruff.isort]
+known-first-party = ["proxmoxer"]
+
+# MyPy configuration
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = [
+    "requests.*",
+    "openssh_wrapper.*",
+    "paramiko.*",
+]
+ignore_missing_imports = true
+
+# Pytest configuration
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--cov=proxmoxer",
+    "--cov-report=term-missing",
+]
+asyncio_mode = "auto"
+
+# Black (legacy, use ruff format instead)
 [tool.black]
 line-length = 100
-target-version = ['py37']
+target-version = ['py310']

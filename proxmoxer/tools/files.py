@@ -1,279 +1,410 @@
+"""
+Async file operations for Proxmoxer.
+
+Provides high-level async API for uploading/downloading files to Proxmox storage
+with checksum validation and retry logic.
+"""
+
+from __future__ import annotations
+
 __author__ = "John Hollowell"
-__copyright__ = "(c) John Hollowell 2023"
+__copyright__ = "(c) John Hollowell 2023-2025"
 __license__ = "MIT"
 
 import hashlib
 import logging
-import os
-import sys
 from enum import Enum
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urljoin, urlparse
+from typing import Any, Callable
 
-from proxmoxer import ProxmoxResource, ResourceException
-from proxmoxer.tools.tasks import Tasks
+import aiofiles
+import aiohttp
 
-CHECKSUM_CHUNK_SIZE = 16384  # read 16k at a time while calculating the checksum for upload
+from ..exceptions import FileOperationError
+from ..retry import retry_async
+from ..types import ResponseData
+
+CHECKSUM_CHUNK_SIZE = 65536  # 64KB chunks for async reading
 
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.WARNING)
-
-try:
-    import requests
-except ImportError:
-    logger.error("Files tools requires 'requests' module\n")
-    sys.exit(1)
 
 
 class ChecksumInfo:
-    def __init__(self, name: str, hex_size: int):
+    """Checksum algorithm information."""
+
+    def __init__(self, name: str, hex_size: int) -> None:
+        """
+        Initialize checksum info.
+
+        Args:
+            name: Algorithm name
+            hex_size: Size of hex digest
+        """
         self.name = name
         self.hex_size = hex_size
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return algorithm name."""
         return self.name
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return detailed representation."""
         return f"{self.name} ({self.hex_size} digits)"
 
 
 class SupportedChecksums(Enum):
     """
-    An Enum of the checksum types supported by Proxmox
+    Checksum types supported by Proxmox.
+
+    Ordered by preference (strongest first).
     """
 
-    # ordered by preference for longer/stronger checksums first
     SHA512 = ChecksumInfo("sha512", 128)
     SHA256 = ChecksumInfo("sha256", 64)
-    SHA224 = ChecksumInfo("sha224", 56)
     SHA384 = ChecksumInfo("sha384", 96)
+    SHA224 = ChecksumInfo("sha224", 56)
     MD5 = ChecksumInfo("md5", 32)
     SHA1 = ChecksumInfo("sha1", 40)
 
 
 class Files:
     """
-    Ease-of-use tools for interacting with the uploading/downloading files
-    in Proxmox VE
+    Async file operations for Proxmox storage.
+
+    Provides methods for uploading/downloading files with checksum validation.
     """
 
-    def __init__(self, prox: ProxmoxResource, node: str, storage: str):
+    def __init__(self, prox: Any, node: str, storage: str) -> None:
+        """
+        Initialize Files helper.
+
+        Args:
+            prox: ProxmoxAPI instance
+            node: Node name
+            storage: Storage name
+        """
         self._prox = prox
         self._node = node
         self._storage = storage
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return string representation."""
         return f"Files ({self._node}/{self._storage} at {self._prox})"
 
-    def upload_local_file_to_storage(
+    async def calculate_checksum(
         self,
-        filename: str,
+        file_path: Path,
+        algorithm: str = "sha256",
+        *,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> str:
+        """
+        Calculate file checksum asynchronously.
+
+        Args:
+            file_path: Path to file
+            algorithm: Hash algorithm name
+            progress_callback: Optional callback (bytes_read, total_bytes)
+
+        Returns:
+            Hex digest string
+
+        Raises:
+            FileOperationError: If calculation fails
+        """
+        try:
+            hasher = hashlib.new(algorithm)
+            file_size = file_path.stat().st_size
+            bytes_read = 0
+
+            async with aiofiles.open(file_path, "rb") as f:
+                while True:
+                    chunk = await f.read(CHECKSUM_CHUNK_SIZE)
+                    if not chunk:
+                        break
+
+                    hasher.update(chunk)
+                    bytes_read += len(chunk)
+
+                    if progress_callback:
+                        progress_callback(bytes_read, file_size)
+
+            logger.debug(
+                f"Calculated {algorithm} checksum for {file_path}: {hasher.hexdigest()}"
+            )
+
+            return hasher.hexdigest()
+
+        except Exception as e:
+            raise FileOperationError(
+                f"Failed to calculate checksum: {e}",
+                file_path=str(file_path),
+                operation="checksum",
+            ) from e
+
+    @retry_async(max_attempts=3, initial_delay=1.0)
+    async def upload_local_file_to_storage(
+        self,
+        filename: str | Path,
+        *,
         do_checksum_check: bool = True,
-        blocking_status: bool = True,
-    ):
+        wait_for_task: bool = True,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> ResponseData:
+        """
+        Upload local file to Proxmox storage.
+
+        Args:
+            filename: Path to file
+            do_checksum_check: Calculate and verify checksum
+            wait_for_task: Wait for upload task to complete
+            progress_callback: Optional progress callback
+
+        Returns:
+            Task status or UPID
+
+        Raises:
+            FileOperationError: If upload fails
+        """
         file_path = Path(filename)
 
         if not file_path.is_file():
-            logger.error(f'"{file_path.absolute()}" does not exist or is not a file')
-            return None
+            raise FileOperationError(
+                f"File does not exist: {file_path}",
+                file_path=str(file_path),
+                operation="upload",
+            )
 
-        # init to None in case errors cause no values to be set
-        upid: str = ""
-        checksum: str = None
-        checksum_type: str = None
+        checksum = None
+        checksum_type = None
 
         try:
-            with open(file_path.absolute(), "rb") as f_obj:
-                if do_checksum_check:
-                    # iterate through SupportedChecksums and find the first one in hashlib.algorithms_available
-                    for checksum_info in (v.value for v in SupportedChecksums):
-                        if checksum_info.name in hashlib.algorithms_available:
-                            checksum_type = checksum_info.name
-                            break
+            if do_checksum_check:
+                # Find best available checksum algorithm
+                for checksum_info in (v.value for v in SupportedChecksums):
+                    if checksum_info.name in hashlib.algorithms_available:
+                        checksum_type = checksum_info.name
+                        break
 
-                    if checksum_type is None:
-                        logger.warning(
-                            "There are no Proxmox supported checksums which are supported by hashlib. Skipping checksum validation"
-                        )
-                    else:
-                        h = hashlib.new(checksum_type)
+                if checksum_type is None:
+                    logger.warning(
+                        "No supported checksum algorithm found, skipping validation"
+                    )
+                else:
+                    # Calculate checksum
+                    checksum = await self.calculate_checksum(
+                        file_path,
+                        checksum_type,
+                        progress_callback=progress_callback,
+                    )
 
-                        # Iterate through the file in CHECKSUM_CHUNK_SIZE size
-                        for byte_block in iter(lambda: f_obj.read(CHECKSUM_CHUNK_SIZE), b""):
-                            h.update(byte_block)
-                        checksum = h.hexdigest()
-                        logger.debug(
-                            f"The {checksum_type} checksum of {file_path.absolute()} is {checksum}"
-                        )
+            # Determine content type
+            content_type = "iso" if file_path.suffix.lower() == ".iso" else "vztmpl"
 
-                        # reset to the start of the file so the upload can use the same file handle
-                        f_obj.seek(0)
+            # Prepare upload parameters
+            upload_params: dict[str, Any] = {
+                "content": content_type,
+            }
 
-                params = {
-                    "content": "iso" if file_path.absolute().name.endswith("iso") else "vztmpl",
-                    "checksum-algorithm": checksum_type,
-                    "checksum": checksum,
-                    "filename": f_obj,
-                }
-                upid = self._prox.nodes(self._node).storage(self._storage).upload.post(**params)
-        except OSError as e:
-            logger.error(e)
-            return None
+            if checksum and checksum_type:
+                upload_params["checksum-algorithm"] = checksum_type
+                upload_params["checksum"] = checksum
 
-        if blocking_status:
-            return Tasks.blocking_status(self._prox, upid)
-        else:
-            return self._prox.nodes(self._node).tasks(upid).status.get()
+            # Open file for upload
+            async with aiofiles.open(file_path, "rb") as f:
+                # Read file content
+                file_content = await f.read()
 
-    def download_file_to_storage(
+                # Upload via API
+                logger.info(f"Uploading {file_path.name} to {self._node}/{self._storage}")
+
+                upid = await self._prox.nodes(self._node).storage(self._storage).upload.post(
+                    filename=file_content,
+                    **upload_params,
+                )
+
+            logger.info(f"File uploaded successfully: {upid}")
+
+            # Wait for task completion if requested
+            if wait_for_task:
+                from .tasks import Tasks
+
+                result = await Tasks.wait_for_task(self._prox, upid)
+                return result
+            else:
+                return await self._prox.nodes(self._node).tasks(upid).status.get()
+
+        except Exception as e:
+            raise FileOperationError(
+                f"Failed to upload file: {e}",
+                file_path=str(file_path),
+                operation="upload",
+            ) from e
+
+    @retry_async(max_attempts=3, initial_delay=1.0)
+    async def download_file_to_storage(
         self,
         url: str,
-        checksum: Optional[str] = None,
-        checksum_type: Optional[str] = None,
-        blocking_status: bool = True,
-    ):
-        file_info = self.get_file_info(url)
-        filename = None
+        *,
+        checksum: str | None = None,
+        checksum_type: str | None = None,
+        wait_for_task: bool = True,
+    ) -> ResponseData:
+        """
+        Download file from URL to Proxmox storage.
 
-        if file_info is not None:
-            filename = file_info.get("filename")
+        Args:
+            url: File URL
+            checksum: Optional checksum value
+            checksum_type: Optional checksum algorithm
+            wait_for_task: Wait for download task completion
 
-        if checksum is None and checksum_type is None:
-            checksum, checksum_info = self.get_checksums_from_file_url(url, filename)
-            checksum_type = checksum_info.name if checksum_info else None
-        elif checksum is None or checksum_type is None:
-            logger.error(
-                "Must pass both checksum and checksum_type or leave both None for auto-discovery"
-            )
-            return None
+        Returns:
+            Task status or UPID
 
-        if checksum is None or checksum_type is None:
-            logger.warning("Unable to discover checksum. Will not do checksum validation")
-
-        params = {
-            "checksum-algorithm": checksum_type,
-            "url": url,
-            "checksum": checksum,
-            "content": "iso" if url.endswith("iso") else "vztmpl",
-            "filename": filename,
-        }
-        upid = self._prox.nodes(self._node).storage(self._storage)("download-url").post(**params)
-
-        if blocking_status:
-            return Tasks.blocking_status(self._prox, upid)
-        else:
-            return self._prox.nodes(self._node).tasks(upid).status.get()
-
-    def get_file_info(self, url: str):
+        Raises:
+            FileOperationError: If download fails
+        """
         try:
-            return self._prox.nodes(self._node)("query-url-metadata").get(url=url)
+            # Get file info if available
+            file_info = await self.get_file_info(url)
+            filename = file_info.get("filename") if file_info else None
 
-        except ResourceException as e:
-            logger.warning(f"Unable to get information for {url}: {e}")
+            # Auto-discover checksum if not provided
+            if checksum is None and checksum_type is None:
+                checksum, checksum_info = await self.get_checksums_from_file_url(
+                    url, filename
+                )
+                checksum_type = checksum_info.name if checksum_info else None
+            elif checksum is None or checksum_type is None:
+                raise FileOperationError(
+                    "Must provide both checksum and checksum_type, or neither",
+                    file_path=url,
+                    operation="download",
+                )
+
+            # Prepare download parameters
+            download_params: dict[str, Any] = {
+                "content": "iso",  # Default to ISO
+                "url": url,
+            }
+
+            if filename:
+                download_params["filename"] = filename
+
+            if checksum and checksum_type:
+                download_params["checksum-algorithm"] = checksum_type
+                download_params["checksum"] = checksum
+
+            logger.info(f"Downloading {url} to {self._node}/{self._storage}")
+
+            # Trigger download
+            upid = await self._prox.nodes(self._node).storage(self._storage).download_url.post(
+                **download_params
+            )
+
+            logger.info(f"Download started: {upid}")
+
+            # Wait for task if requested
+            if wait_for_task:
+                from .tasks import Tasks
+
+                result = await Tasks.wait_for_task(self._prox, upid)
+                return result
+            else:
+                return await self._prox.nodes(self._node).tasks(upid).status.get()
+
+        except Exception as e:
+            raise FileOperationError(
+                f"Failed to download file: {e}",
+                file_path=url,
+                operation="download",
+            ) from e
+
+    async def get_file_info(self, url: str) -> dict[str, Any] | None:
+        """
+        Get file information from URL (HEAD request).
+
+        Args:
+            url: File URL
+
+        Returns:
+            File info dictionary or None
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.head(url, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        return None
+
+                    content_disposition = resp.headers.get("Content-Disposition", "")
+                    filename = None
+
+                    # Parse filename from Content-Disposition
+                    if "filename=" in content_disposition:
+                        filename = content_disposition.split("filename=")[1].strip('"')
+
+                    return {
+                        "filename": filename,
+                        "content_type": resp.headers.get("Content-Type"),
+                        "content_length": resp.headers.get("Content-Length"),
+                    }
+
+        except Exception as e:
+            logger.warning(f"Failed to get file info for {url}: {e}")
             return None
 
-    @staticmethod
-    def get_checksums_from_file_url(
-        url: str, filename: str = None, preferred_type=SupportedChecksums.SHA512.value
-    ):
-        getters_by_quality = [
-            Files._get_checksum_from_sibling_file,
-            Files._get_checksum_from_extension,
-            Files._get_checksum_from_extension_upper,
+    async def get_checksums_from_file_url(
+        self, url: str, filename: str | None = None
+    ) -> tuple[str | None, ChecksumInfo | None]:
+        """
+        Try to discover checksums from common checksum file URLs.
+
+        Args:
+            url: Base file URL
+            filename: Optional filename
+
+        Returns:
+            Tuple of (checksum, checksum_info) or (None, None)
+        """
+        # Try common checksum file patterns
+        checksum_patterns = [
+            ("{base}SHA512SUMS", SupportedChecksums.SHA512.value),
+            ("{base}SHA256SUMS", SupportedChecksums.SHA256.value),
+            ("{base}.sha512", SupportedChecksums.SHA512.value),
+            ("{base}.sha256", SupportedChecksums.SHA256.value),
+            ("{base}.md5", SupportedChecksums.MD5.value),
         ]
 
-        # hacky way to try the preferred_type first while still trying all types with no duplicates
-        all_types_with_priority = list(
-            dict.fromkeys([preferred_type, *(map(lambda t: t.value, SupportedChecksums))])
-        )
-        for c_info in all_types_with_priority:
-            for getter in getters_by_quality:
-                checksum: str = getter(url, c_info, filename)
-                if checksum is not None:
-                    logger.info(f"{getter} found {str(c_info)} checksum {checksum}")
-                    return (checksum, c_info)
-                else:
-                    logger.debug(f"{getter} found no {str(c_info)} checksum")
+        base_url = url.rsplit("/", 1)[0] + "/"
 
-        return (None, None)
+        async with aiohttp.ClientSession() as session:
+            for pattern, checksum_info in checksum_patterns:
+                checksum_url = pattern.format(base=base_url)
 
-    @staticmethod
-    def _get_checksum_from_sibling_file(
-        url: str, checksum_info: ChecksumInfo, filename: Optional[str] = None
-    ) -> Optional[str]:
-        """
-        Uses a checksum file in the same path as the target file to discover the checksum
+                try:
+                    async with session.get(checksum_url) as resp:
+                        if resp.status == 200:
+                            content = await resp.text()
 
-        :param url: the URL string of the target file
-        :type url: str
-        :param checksum_info: the type of checksum to search for
-        :type checksum_info: ChecksumInfo
-        :param filename: the filename to use for finding the checksum. If None, it will be discovered from the url
-        :type filename: str | None
-        :return: a string of the checksum if found, else None
-        :rtype: str | None
-        """
-        sumfile_url = urljoin(url, (checksum_info.name + "SUMS").upper())
-        filename = filename or os.path.basename(urlparse(url).path)
+                            # Parse checksum file
+                            for line in content.splitlines():
+                                if filename and filename in line:
+                                    checksum = line.split()[0]
+                                    logger.debug(
+                                        f"Found {checksum_info.name} checksum: {checksum}"
+                                    )
+                                    return checksum, checksum_info
 
-        return Files._get_checksum_helper(sumfile_url, filename, checksum_info)
+                except Exception:
+                    continue
 
-    @staticmethod
-    def _get_checksum_from_extension(
-        url: str, checksum_info: ChecksumInfo, filename: Optional[str] = None
-    ) -> Optional[str]:
-        """
-        Uses a checksum file with a checksum extension added to the target file to discover the checksum
+        logger.warning(f"Could not find checksum for {url}")
+        return None, None
 
-        :param url: the URL string of the target file
-        :type url: str
-        :param checksum_info: the type of checksum to search for
-        :type checksum_info: ChecksumInfo
-        :param filename: the filename to use for finding the checksum. If None, it will be discovered from the url
-        :type filename: str | None
-        :return: a string of the checksum if found, else None
-        :rtype: str | None
-        """
-        sumfile_url = url + "." + checksum_info.name
-        filename = filename or os.path.basename(urlparse(url).path)
 
-        return Files._get_checksum_helper(sumfile_url, filename, checksum_info)
-
-    @staticmethod
-    def _get_checksum_from_extension_upper(
-        url: str, checksum_info: ChecksumInfo, filename: Optional[str] = None
-    ) -> Optional[str]:
-        """
-        Uses a checksum file with a checksum extension added to the target file to discover the checksum
-
-        :param url: the URL string of the target file
-        :type url: str
-        :param checksum_info: the type of checksum to search for
-        :type checksum_info: ChecksumInfo
-        :param filename: the filename to use for finding the checksum. If None, it will be discovered from the url
-        :type filename: str | None
-        :return: a string of the checksum if found, else None
-        :rtype: str | None
-        """
-        sumfile_url = url + "." + checksum_info.name.upper()
-        filename = filename or os.path.basename(urlparse(url).path)
-
-        return Files._get_checksum_helper(sumfile_url, filename, checksum_info)
-
-    @staticmethod
-    def _get_checksum_helper(sumfile_url: str, filename: str, checksum_info: ChecksumInfo):
-        logger.debug(f"getting {sumfile_url}")
-        try:
-            resp = requests.get(sumfile_url, timeout=10)
-        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
-            logger.info(f"Failed when trying to get {sumfile_url}")
-            return None
-
-        if resp.status_code == 200:
-            for line in resp.iter_lines():
-                line_str = line.decode("utf-8")
-                logger.debug(f"checking for '{filename}' in '{line_str}'")
-                if filename in str(line_str):
-                    return line_str[0 : checksum_info.hex_size]
-        return None
+__all__ = [
+    "Files",
+    "ChecksumInfo",
+    "SupportedChecksums",
+]

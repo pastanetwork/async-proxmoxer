@@ -1,274 +1,488 @@
+"""
+Async HTTPS backend for Proxmoxer using aiohttp.
+
+Provides high-performance async HTTP communication with Proxmox services
+including authentication, file uploads, and connection pooling.
+"""
+
 __author__ = "Oleg Butovich"
-__copyright__ = "(c) Oleg Butovich 2013-2017"
+__copyright__ = "(c) Oleg Butovich 2013-2024"
 __license__ = "MIT"
 
-
+import asyncio
 import io
-import json
 import logging
 import os
 import platform
-import sys
 import time
 from shlex import split as shell_split
+from typing import Any
 
-from proxmoxer.core import SERVICES, AuthenticationError, config_failure
+import aiohttp
+
+from ..core import SERVICES
+from ..exceptions import AuthenticationError, ConfigurationError
+from ..retry import retry_async
+from ..serializers import JsonSerializer, get_serializer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.WARNING)
 
 STREAMING_SIZE_THRESHOLD = 10 * 1024 * 1024  # 10 MiB
 SSL_OVERFLOW_THRESHOLD = 2147483135  # 2^31 - 1 - 512
 
-try:
-    import requests
-    from requests.auth import AuthBase
-    from requests.cookies import cookiejar_from_dict
 
-    # Disable warnings about using untrusted TLS
-    requests.packages.urllib3.disable_warnings()
-except ImportError:
-    logger.error("Chosen backend requires 'requests' module\n")
-    sys.exit(1)
+class ProxmoxHTTPAuthBase:
+    """Base class for authentication handlers."""
 
+    def __init__(
+        self,
+        *,
+        timeout: float = 5.0,
+        service: str = "PVE",
+        verify_ssl: bool = True,
+        cert: Any | None = None,
+    ) -> None:
+        """
+        Initialize auth base.
 
-class ProxmoxHTTPAuthBase(AuthBase):
-    def __call__(self, req):
-        return req
-
-    def get_cookies(self):
-        return cookiejar_from_dict({})
-
-    def get_tokens(self):
-        return None, None
-
-    def __init__(self, timeout=5, service="PVE", verify_ssl=False, cert=None):
-        self.timeout = timeout
+        Args:
+            timeout: Request timeout in seconds
+            service: Service type (PVE, PMG, PBS)
+            verify_ssl: Whether to verify SSL certificates
+            cert: Client certificate for mutual TLS
+        """
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.service = service
         self.verify_ssl = verify_ssl
         self.cert = cert
 
+    async def get_cookies(self) -> dict[str, str]:
+        """Get cookies for authentication."""
+        return {}
+
+    async def get_tokens(self) -> tuple[str | None, str | None]:
+        """Get auth and CSRF tokens."""
+        return None, None
+
+    async def prepare_request(self, session: aiohttp.ClientSession, method: str) -> None:
+        """
+        Prepare request with authentication.
+
+        Args:
+            session: aiohttp session
+            method: HTTP method
+        """
+        pass
+
 
 class ProxmoxHTTPAuth(ProxmoxHTTPAuthBase):
-    # number of seconds between renewing access tickets (must be less than 7200 to function correctly)
-    # if calls are made less frequently than 2 hrs, using the API token auth is recommended
-    renew_age = 3600
+    """
+    Password-based authentication with automatic ticket renewal.
 
-    def __init__(self, username, password, otp=None, base_url="", **kwargs):
+    Proxmox uses ticket-based authentication with a 2-hour expiration.
+    This handler automatically renews tickets before they expire.
+    """
+
+    renew_age = 3600  # Renew after 1 hour (before 2-hour expiration)
+
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        *,
+        otp: str | None = None,
+        base_url: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize password authentication.
+
+        Args:
+            username: Username (e.g., "root@pam")
+            password: Password
+            otp: One-Time Password for 2FA
+            base_url: Base URL for API
+            **kwargs: Additional auth options
+        """
         super().__init__(**kwargs)
         self.base_url = base_url
         self.username = username
-        self.pve_auth_ticket = ""
+        self.password = password
+        self.otp = otp
 
-        self._get_new_tokens(password=password, otp=otp)
+        self.pve_auth_ticket: str = ""
+        self.csrf_prevention_token: str = ""
+        self.birth_time: float = 0.0
+        self._lock = asyncio.Lock()
 
-    def _get_new_tokens(self, password=None, otp=None):
+    async def _get_new_tokens(self, password: str | None = None, otp: str | None = None) -> None:
+        """
+        Acquire new authentication tokens from Proxmox.
+
+        Args:
+            password: Password (or ticket for renewal)
+            otp: One-Time Password
+        """
         if password is None:
-            # refresh from existing (unexpired) ticket
+            # Refresh from existing ticket
             password = self.pve_auth_ticket
 
         data = {"username": self.username, "password": password}
         if otp:
             data["otp"] = otp
 
-        response_data = requests.post(
-            self.base_url + "/access/ticket",
-            verify=self.verify_ssl,
-            timeout=self.timeout,
-            data=data,
-            cert=self.cert,
-        ).json()["data"]
-        if response_data is None:
-            raise AuthenticationError(
-                "Couldn't authenticate user: {0} to {1}".format(
-                    self.username, self.base_url + "/access/ticket"
-                )
-            )
-        if response_data.get("NeedTFA") is not None:
-            raise AuthenticationError(
-                "Couldn't authenticate user: missing Two Factor Authentication (TFA)"
-            )
+        # Create SSL context
+        ssl_context = (
+            aiohttp.TCPConnector(ssl=True if self.verify_ssl else False).ssl
+            if self.verify_ssl
+            else False
+        )
 
-        self.birth_time = time.monotonic()
-        self.pve_auth_ticket = response_data["ticket"]
-        self.csrf_prevention_token = response_data["CSRFPreventionToken"]
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/access/ticket",
+                data=data,
+                ssl=ssl_context,
+                timeout=self.timeout,
+            ) as resp:
+                response_data = (await resp.json())["data"]
 
-    def get_cookies(self):
-        return cookiejar_from_dict({self.service + "AuthCookie": self.pve_auth_ticket})
+                if response_data is None:
+                    raise AuthenticationError(
+                        f"Couldn't authenticate user: {self.username}",
+                        auth_method="password",
+                        username=self.username,
+                    )
 
-    def get_tokens(self):
+                if response_data.get("NeedTFA") is not None:
+                    raise AuthenticationError(
+                        "Couldn't authenticate user: missing Two Factor Authentication (TFA)",
+                        auth_method="password",
+                        username=self.username,
+                    )
+
+                self.birth_time = time.monotonic()
+                self.pve_auth_ticket = response_data["ticket"]
+                self.csrf_prevention_token = response_data["CSRFPreventionToken"]
+
+                logger.debug(f"Acquired new auth ticket for {self.username}")
+
+    async def initialize(self) -> None:
+        """Initialize authentication by acquiring initial token."""
+        await self._get_new_tokens(password=self.password, otp=self.otp)
+
+    async def get_cookies(self) -> dict[str, str]:
+        """Get authentication cookies."""
+        return {f"{self.service}AuthCookie": self.pve_auth_ticket}
+
+    async def get_tokens(self) -> tuple[str, str]:
+        """Get auth and CSRF tokens."""
         return self.pve_auth_ticket, self.csrf_prevention_token
 
-    def __call__(self, req):
-        # refresh ticket if older than `renew_age`
-        time_diff = time.monotonic() - self.birth_time
-        if time_diff >= self.renew_age:
-            logger.debug(f"refreshing ticket (age {time_diff})")
-            self._get_new_tokens()
+    async def prepare_request(self, session: aiohttp.ClientSession, method: str) -> None:
+        """
+        Prepare request with auth, refreshing token if needed.
 
-        # only attach CSRF token if needed (reduce interception risk)
-        if req.method != "GET":
-            req.headers["CSRFPreventionToken"] = self.csrf_prevention_token
-        return req
+        Args:
+            session: aiohttp session
+            method: HTTP method
+        """
+        # Refresh ticket if older than renew_age
+        async with self._lock:
+            time_diff = time.monotonic() - self.birth_time
+
+            if time_diff >= self.renew_age:
+                logger.debug(f"Refreshing ticket (age {time_diff:.1f}s)")
+                await self._get_new_tokens()
+
+        # Add cookies
+        session.cookie_jar.update_cookies(await self.get_cookies())
+
+        # Add CSRF token for non-GET requests
+        if method != "GET":
+            session.headers["CSRFPreventionToken"] = self.csrf_prevention_token
 
 
 class ProxmoxHTTPApiTokenAuth(ProxmoxHTTPAuthBase):
-    def __init__(self, username, token_name, token_value, **kwargs):
+    """
+    API Token authentication.
+
+    More secure and recommended for automation. No session management needed.
+    """
+
+    def __init__(
+        self,
+        username: str,
+        token_name: str,
+        token_value: str,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize API token authentication.
+
+        Args:
+            username: Username (e.g., "root@pam")
+            token_name: Token name
+            token_value: Token secret value
+            **kwargs: Additional auth options
+        """
         super().__init__(**kwargs)
         self.username = username
         self.token_name = token_name
         self.token_value = token_value
 
-    def __call__(self, req):
-        req.headers["Authorization"] = "{0}APIToken={1}!{2}{3}{4}".format(
-            self.service,
-            self.username,
-            self.token_name,
-            SERVICES[self.service]["token_separator"],
-            self.token_value,
+    async def initialize(self) -> None:
+        """No initialization needed for token auth."""
+        pass
+
+    async def prepare_request(self, session: aiohttp.ClientSession, method: str) -> None:
+        """
+        Add API token to request headers.
+
+        Args:
+            session: aiohttp session
+            method: HTTP method
+        """
+        token_separator = SERVICES[self.service]["token_separator"]
+        session.headers["Authorization"] = (
+            f"{self.service}APIToken={self.username}!{self.token_name}"
+            f"{token_separator}{self.token_value}"
         )
-        req.cert = self.cert
-        return req
 
 
-class JsonSerializer:
-    content_types = [
-        "application/json",
-        "application/x-javascript",
-        "text/javascript",
-        "text/x-javascript",
-        "text/x-json",
-    ]
+class AsyncResponse:
+    """
+    Wrapper for aiohttp response to match expected interface.
 
-    def get_accept_types(self):
-        return ", ".join(self.content_types)
+    Provides compatibility with serializers expecting status_code,
+    content, text, and reason attributes.
+    """
 
-    def loads(self, response):
-        try:
-            return json.loads(response.content.decode("utf-8"))["data"]
-        except (UnicodeDecodeError, ValueError):
-            return {"errors": response.content}
-
-    def loads_errors(self, response):
-        try:
-            return json.loads(response.text).get("errors")
-        except (UnicodeDecodeError, ValueError):
-            return {"errors": response.content}
-
-
-# pylint:disable=arguments-renamed
-class ProxmoxHttpSession(requests.Session):
-    def request(
+    def __init__(
         self,
-        method,
-        url,
-        params=None,
-        data=None,
-        headers=None,
-        cookies=None,
-        files=None,
-        auth=None,
-        timeout=None,
-        allow_redirects=True,
-        proxies=None,
-        hooks=None,
-        stream=None,
-        verify=None,
-        cert=None,
-        serializer=None,
-    ):
-        a = auth or self.auth
-        c = cookies or self.cookies
+        status_code: int,
+        content: bytes,
+        text: str,
+        reason: str | None = None,
+    ) -> None:
+        """
+        Initialize response wrapper.
 
-        # set verify flag from auth if request does not have this parameter explicitly
-        if verify is None:
-            verify = a.verify_ssl
+        Args:
+            status_code: HTTP status code
+            content: Response body as bytes
+            text: Response body as text
+            reason: HTTP reason phrase
+        """
+        self.status_code = status_code
+        self.content = content
+        self.text = text
+        self.reason = reason
 
-        if timeout is None:
-            timeout = a.timeout
 
-        # pull cookies from auth if not present
-        if (not c) and a:
-            cookies = a.get_cookies()
+class ProxmoxHttpSession:
+    """
+    Async HTTP session for Proxmox API with file upload support.
 
-        # filter out streams
-        files = files or {}
+    Handles:
+    - Authentication
+    - Large file uploads with streaming
+    - Command splitting for QEMU exec
+    - Connection pooling
+    """
+
+    def __init__(
+        self,
+        auth: ProxmoxHTTPAuthBase,
+        *,
+        verify_ssl: bool = True,
+        timeout: float = 5.0,
+        connector: aiohttp.BaseConnector | None = None,
+    ) -> None:
+        """
+        Initialize async HTTP session.
+
+        Args:
+            auth: Authentication handler
+            verify_ssl: Whether to verify SSL certificates
+            timeout: Default timeout in seconds
+            connector: Optional custom aiohttp connector
+        """
+        self.auth = auth
+        self.verify_ssl = verify_ssl
+        self.default_timeout = aiohttp.ClientTimeout(total=timeout)
+
+        # Create SSL context
+        if connector is None:
+            ssl_context = True if verify_ssl else False
+            connector = aiohttp.TCPConnector(ssl=ssl_context, limit=100)
+
+        self._session: aiohttp.ClientSession | None = None
+        self._connector = connector
+        self._closed = False
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=self._connector,
+                timeout=self.default_timeout,
+                headers={
+                    "Connection": "keep-alive",
+                    "Accept": ", ".join(JsonSerializer().content_types),
+                },
+            )
+        return self._session
+
+    @retry_async(max_attempts=3, initial_delay=0.5)
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncResponse:
+        """
+        Make async HTTP request with automatic retry.
+
+        Args:
+            method: HTTP method
+            url: Request URL
+            params: Query parameters
+            data: Request body data
+            **kwargs: Additional options
+
+        Returns:
+            AsyncResponse object
+        """
+        session = await self._get_session()
+
+        # Prepare authentication
+        await self.auth.prepare_request(session, method)
+
+        # Handle file uploads and command splitting
+        files = {}
         data = data or {}
         total_file_size = 0
-        for k, v in data.copy().items():
-            # split qemu exec commands for proper parsing by PVE (issue#89)
+
+        for k, v in list(data.items()):
+            # Split QEMU exec commands for proper parsing (issue #89)
             if k == "command" and url.endswith("agent/exec"):
                 if isinstance(v, list):
                     data[k] = v
                 elif "Windows" not in platform.platform():
                     data[k] = shell_split(v)
+
+            # Handle file uploads
             if isinstance(v, io.IOBase):
                 total_file_size += get_file_size(v)
-
-                # add in filename from file pointer (patch for https://github.com/requests/toolbelt/pull/316)
-                # add Content-Type since Proxmox requires it (https://bugzilla.proxmox.com/show_bug.cgi?id=4344)
-                files[k] = (requests.utils.guess_filename(v), v, "application/octet-stream")
+                files[k] = v
                 del data[k]
 
-        # if there are any large files, send all data and files using streaming multipart encoding
-        if total_file_size > STREAMING_SIZE_THRESHOLD:
-            try:
-                # pylint:disable=import-outside-toplevel
-                from requests_toolbelt import MultipartEncoder
+        # Prepare request body
+        if files:
+            # Use multipart for file uploads
+            form_data = aiohttp.FormData()
 
-                encoder = MultipartEncoder(fields={**data, **files})
-                data = encoder
-                files = None
-                headers = {"Content-Type": encoder.content_type}
-            except ImportError:
-                # if the files will cause issues with the SSL 2GiB limit (https://bugs.python.org/issue42853#msg384566)
-                if total_file_size > SSL_OVERFLOW_THRESHOLD:
-                    logger.warning(
-                        "Install 'requests_toolbelt' to add support for files larger than 2GiB"
-                    )
-                    raise OverflowError("Unable to upload a payload larger than 2 GiB")
-                else:
-                    logger.info(
-                        "Installing 'requests_toolbelt' will decrease memory used during upload"
-                    )
+            # Add regular data fields
+            for k, v in data.items():
+                form_data.add_field(k, str(v))
 
-        return super().request(
+            # Add file fields
+            for k, file_obj in files.items():
+                filename = getattr(file_obj, "name", "upload")
+                form_data.add_field(
+                    k,
+                    file_obj,
+                    filename=filename,
+                    content_type="application/octet-stream",
+                )
+
+            request_data = form_data
+        else:
+            request_data = data if data else None
+
+        # Make request
+        async with session.request(
             method,
             url,
-            params,
-            data,
-            headers,
-            cookies,
-            files,
-            auth,
-            timeout,
-            allow_redirects,
-            proxies,
-            hooks,
-            stream,
-            verify,
-            cert,
-        )
+            params=params,
+            data=request_data,
+            **kwargs,
+        ) as resp:
+            content = await resp.read()
+            text = await resp.text()
+
+            return AsyncResponse(
+                status_code=resp.status,
+                content=content,
+                text=text,
+                reason=resp.reason,
+            )
+
+    async def close(self) -> None:
+        """Close session and cleanup."""
+        if self._closed:
+            return
+
+        self._closed = True
+
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
 
 
 class Backend:
+    """
+    Async HTTPS backend for Proxmox API.
+
+    Provides async HTTP communication with automatic authentication,
+    connection pooling, and file upload support.
+    """
+
     def __init__(
         self,
-        host,
-        user=None,
-        password=None,
-        otp=None,
-        port=None,
-        verify_ssl=True,
-        mode="json",
-        timeout=5,
-        token_name=None,
-        token_value=None,
-        path_prefix=None,
-        service="PVE",
-        cert=None,
-    ):
+        host: str,
+        *,
+        user: str | None = None,
+        password: str | None = None,
+        otp: str | None = None,
+        port: int | None = None,
+        verify_ssl: bool = True,
+        mode: str = "json",
+        timeout: float = 5.0,
+        token_name: str | None = None,
+        token_value: str | None = None,
+        path_prefix: str | None = None,
+        service: str = "PVE",
+        cert: Any | None = None,
+    ) -> None:
+        """
+        Initialize HTTPS backend.
+
+        Args:
+            host: Proxmox server hostname/IP
+            user: Username
+            password: Password
+            otp: One-Time Password for 2FA
+            port: Port (default: service-specific)
+            verify_ssl: Whether to verify SSL certificates
+            mode: Response mode (json)
+            timeout: Request timeout in seconds
+            token_name: API token name
+            token_value: API token value
+            path_prefix: URL path prefix for reverse proxy
+            service: Service type (PVE, PMG, PBS)
+            cert: Client certificate for mutual TLS
+        """
         self.cert = cert
+        self.mode = mode
+
+        # Parse host and port
         host_port = ""
         if len(host.split(":")) > 2:  # IPv6
             if host.startswith("["):
@@ -278,109 +492,115 @@ class Backend:
                 host = f"[{host}]"
         elif ":" in host:
             host, host_port = host.split(":")
-        port = host_port if host_port.isdigit() else port
 
-        # if a port is not specified, use the default port for this service
+        port = int(host_port) if host_port.isdigit() else port
+
+        # Use default port if not specified
         if not port:
             port = SERVICES[service]["default_port"]
 
-        self.mode = mode
+        # Build base URL
         if path_prefix is not None:
             self.base_url = f"https://{host}:{port}/{path_prefix}/api2/{mode}"
         else:
             self.base_url = f"https://{host}:{port}/api2/{mode}"
 
+        # Setup authentication
         if token_name is not None:
             if "token" not in SERVICES[service]["supported_https_auths"]:
-                config_failure("{} does not support API Token authentication", service)
+                raise ConfigurationError(
+                    f"{service} does not support API Token authentication",
+                    option="token_name",
+                    value=token_name,
+                )
 
-            self.auth = ProxmoxHTTPApiTokenAuth(
-                user,
+            self.auth: ProxmoxHTTPAuthBase = ProxmoxHTTPApiTokenAuth(
+                user or "",
                 token_name,
-                token_value,
+                token_value or "",
                 verify_ssl=verify_ssl,
                 timeout=timeout,
                 service=service,
-                cert=self.cert,
+                cert=cert,
             )
         elif password is not None:
             if "password" not in SERVICES[service]["supported_https_auths"]:
-                config_failure("{} does not support password authentication", service)
+                raise ConfigurationError(
+                    f"{service} does not support password authentication",
+                    option="password",
+                )
 
             self.auth = ProxmoxHTTPAuth(
-                user,
+                user or "",
                 password,
-                otp,
+                otp=otp,
                 base_url=self.base_url,
                 verify_ssl=verify_ssl,
                 timeout=timeout,
                 service=service,
-                cert=self.cert,
+                cert=cert,
             )
         else:
-            config_failure("No valid authentication credentials were supplied")
+            raise ConfigurationError(
+                "No valid authentication credentials were supplied",
+                option="auth",
+            )
 
-    def get_session(self):
-        session = ProxmoxHttpSession()
-        session.cert = self.cert
-        session.auth = self.auth
-        # cookies are taken from the auth
-        session.headers["Connection"] = "keep-alive"
-        session.headers["accept"] = self.get_serializer().get_accept_types()
-        return session
+        self._session: ProxmoxHttpSession | None = None
+        self._serializer = get_serializer("https")
 
-    def get_base_url(self):
+    async def initialize(self) -> None:
+        """Initialize backend and authentication."""
+        await self.auth.initialize()
+
+    def get_session(self) -> ProxmoxHttpSession:
+        """Get or create HTTP session."""
+        if self._session is None:
+            self._session = ProxmoxHttpSession(
+                self.auth,
+                verify_ssl=self.auth.verify_ssl,
+                timeout=self.auth.timeout.total if hasattr(self.auth.timeout, "total") else 5.0,
+            )
+        return self._session
+
+    def get_base_url(self) -> str:
+        """Get base URL for API requests."""
         return self.base_url
 
-    def get_serializer(self):
-        assert self.mode == "json"
-        return JsonSerializer()
+    def get_serializer(self) -> JsonSerializer:
+        """Get JSON serializer."""
+        return self._serializer
 
-    def get_tokens(self):
-        """Return the in-use auth and csrf tokens if using user/password auth."""
-        return self.auth.get_tokens()
+    async def get_tokens(self) -> tuple[str | None, str | None]:
+        """Get auth and CSRF tokens."""
+        return await self.auth.get_tokens()
+
+    async def close(self) -> None:
+        """Close backend and cleanup resources."""
+        if self._session:
+            await self._session.close()
 
 
-def get_file_size(file_obj):
-    """Returns the number of bytes in the given file object in total
-    file cursor remains at the same location as when passed in
-
-    :param fileObj: file object of which the get size
-    :type fileObj: file object
-    :return: total bytes in file object
-    :rtype: int
+def get_file_size(file_obj: io.IOBase) -> int:
     """
-    # store existing file cursor location
+    Get total size of file object without changing cursor position.
+
+    Args:
+        file_obj: File object
+
+    Returns:
+        File size in bytes
+    """
     starting_cursor = file_obj.tell()
-
-    # seek to end of file
     file_obj.seek(0, os.SEEK_END)
-
     size = file_obj.tell()
-
-    # reset cursor
     file_obj.seek(starting_cursor)
-
     return size
 
 
-def get_file_size_partial(file_obj):
-    """Returns the number of bytes in the given file object from the current cursor to the end
-
-    :param fileObj: file object of which the get size
-    :type fileObj: file object
-    :return: remaining bytes in file object
-    :rtype: int
-    """
-    # store existing file cursor location
-    starting_cursor = file_obj.tell()
-
-    file_obj.seek(0, os.SEEK_END)
-
-    # get number of byte between where the cursor was set and the end
-    size = file_obj.tell() - starting_cursor
-
-    # reset cursor
-    file_obj.seek(starting_cursor)
-
-    return size
+__all__ = [
+    "Backend",
+    "ProxmoxHTTPAuth",
+    "ProxmoxHTTPApiTokenAuth",
+    "ProxmoxHttpSession",
+]
