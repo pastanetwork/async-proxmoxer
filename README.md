@@ -222,6 +222,8 @@ proxmox = await ProxmoxAPI.create(
 ```
 
 ### API Token (recommended for automation)
+
+**Method 1: Separate user and token name**
 ```python
 proxmox = await ProxmoxAPI.create(
     host="proxmox.example.com",
@@ -230,6 +232,17 @@ proxmox = await ProxmoxAPI.create(
     token_value="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
 )
 ```
+
+**Method 2: Full token ID (convenient - no need to split user and token)**
+```python
+proxmox = await ProxmoxAPI.create(
+    host="proxmox.example.com",
+    full_token_id="root@pam!my-token",
+    token_value="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+)
+```
+
+**Note**: The `full_token_id` parameter automatically parses the format `user@realm!tokenname` and splits it internally. This is more convenient when you have the full token ID from Proxmox.
 
 ---
 

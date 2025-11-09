@@ -7,7 +7,7 @@ and Proxmox Backup Server.
 
 __author__ = "Oleg Butovich"
 __copyright__ = "(c) Oleg Butovich 2013-2025"
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 __license__ = "MIT"
 
 # Core API

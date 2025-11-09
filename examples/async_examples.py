@@ -24,8 +24,14 @@ from proxmoxer.retry import retry_async
 PROXMOX_HOST = "10.0.0.1"
 PROXMOX_USER = "root@pam"
 PROXMOX_PASSWORD = "your_password"
-# Or use API token:
+
+# Or use API token (Method 1 - separate user and token_name):
+# PROXMOX_USER = "root@pam"
 # PROXMOX_TOKEN_NAME = "my-token"
+# PROXMOX_TOKEN_VALUE = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Or use API token (Method 2 - full_token_id, more convenient):
+# PROXMOX_FULL_TOKEN_ID = "root@pam!my-token"
 # PROXMOX_TOKEN_VALUE = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 
@@ -298,7 +304,7 @@ async def example_api_token_auth():
     """Example 9: Using API token authentication."""
     print("\n=== Example 9: API Token Authentication ===\n")
 
-    # Uncomment and fill in your token details:
+    # Method 1: Separate user and token_name
     # async with ProxmoxAPI.create(
     #     host=PROXMOX_HOST,
     #     user=PROXMOX_USER,
@@ -309,7 +315,17 @@ async def example_api_token_auth():
     #     version = await proxmox.version.get()
     #     print(f"Connected with API token: {version['version']}")
 
-    print("(Configure token_name and token_value to use this example)")
+    # Method 2: Full token ID (more convenient - recommended)
+    # async with ProxmoxAPI.create(
+    #     host=PROXMOX_HOST,
+    #     full_token_id="root@pam!my-token",
+    #     token_value="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    #     verify_ssl=False,
+    # ) as proxmox:
+    #     version = await proxmox.version.get()
+    #     print(f"Connected with full_token_id: {version['version']}")
+
+    print("(Configure full_token_id and token_value to use this example)")
 
 
 async def main():

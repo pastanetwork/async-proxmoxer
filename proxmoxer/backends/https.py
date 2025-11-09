@@ -457,6 +457,7 @@ class Backend:
         timeout: float = 5.0,
         token_name: str | None = None,
         token_value: str | None = None,
+        full_token_id: str | None = None,
         path_prefix: str | None = None,
         service: str = "PVE",
         cert: Any | None = None,
@@ -466,18 +467,27 @@ class Backend:
 
         Args:
             host: Proxmox server hostname/IP
-            user: Username
+            user: Username (e.g., "root@pam")
             password: Password
             otp: One-Time Password for 2FA
             port: Port (default: service-specific)
             verify_ssl: Whether to verify SSL certificates
             mode: Response mode (json)
             timeout: Request timeout in seconds
-            token_name: API token name
-            token_value: API token value
+            token_name: API token name (requires user parameter)
+            token_value: API token value (UUID)
+            full_token_id: Full API token ID in format "user@realm!tokenname"
+                          (convenient alternative to separate user+token_name)
             path_prefix: URL path prefix for reverse proxy
             service: Service type (PVE, PMG, PBS)
             cert: Client certificate for mutual TLS
+
+        Examples:
+            # Method 1: Separate user and token_name
+            Backend(host="pve.local", user="root@pam", token_name="mytoken", token_value="uuid")
+
+            # Method 2: Full token ID (more convenient)
+            Backend(host="pve.local", full_token_id="root@pam!mytoken", token_value="uuid")
         """
         self.cert = cert
         self.mode = mode
@@ -504,6 +514,10 @@ class Backend:
             self.base_url = f"https://{host}:{port}/{path_prefix}/api2/{mode}"
         else:
             self.base_url = f"https://{host}:{port}/api2/{mode}"
+
+        # Parse full_token_id if provided (format: user@realm!tokenname)
+        if full_token_id is not None and "!" in full_token_id:
+            user, token_name = full_token_id.split("!", 1)
 
         # Setup authentication
         if token_name is not None:

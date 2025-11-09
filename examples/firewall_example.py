@@ -17,11 +17,30 @@ from proxmoxer.helpers import (
 
 
 async def main():
-    # Initialize connection
+    # Initialize connection - Choose one of the authentication methods below:
+
+    # Method 1: Password authentication
+    # proxmox = await ProxmoxAPI.create(
+    #     host="pve.example.com",
+    #     user="root@pam",
+    #     password="password",
+    #     verify_ssl=False,
+    # )
+
+    # Method 2: API Token (separate user and token_name)
+    # proxmox = await ProxmoxAPI.create(
+    #     host="pve.example.com",
+    #     user="root@pam",
+    #     token_name="my-token",
+    #     token_value="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    #     verify_ssl=False,
+    # )
+
+    # Method 3: API Token with full_token_id (convenient - recommended)
     proxmox = await ProxmoxAPI.create(
         host="pve.example.com",
-        user="root@pam",
-        password="password",
+        full_token_id="root@pam!my-token",
+        token_value="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
         verify_ssl=False,
     )
 

@@ -1,3 +1,22 @@
+## 3.1.0 (2025-01-09)
+
+* Addition (https): Added `full_token_id` parameter to simplify API token authentication
+  - Accepts full token ID in format `user@realm!tokenname` (e.g., `root@pam!my-token`)
+  - Automatically parses and splits into user and token_name components
+  - More convenient alternative to separate `user` and `token_name` parameters
+  - Backwards compatible with existing authentication methods
+
+## 3.0.0 (2025-01-XX)
+
+* Complete async/await refactoring with full asyncio support
+* Migration from requests to aiohttp for HTTP backend
+* Added connection pooling and automatic retry logic
+* Added FirewallManager helper for complete firewall management
+* Performance improvements with orjson integration (3-5x faster JSON parsing)
+* Added comprehensive type hints (mypy strict mode)
+* Added Files and Tasks tools for advanced operations
+* Multiple new helper modules (access, cluster, nodes, storage, etc.)
+
 ## 2.2.0 (2024-12-13)
 
 * Bugfix (local,openssh,paramiko): Remove IP/hostname from command path ([Andrea Dainese](https://github.com/dainok), [John Hollowell](https://github.com/jhollowe))
